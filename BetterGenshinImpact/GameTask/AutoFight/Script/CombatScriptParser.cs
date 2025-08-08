@@ -66,13 +66,17 @@ public class CombatScriptParser
         {
             var l = line.Trim()
                 .Replace("（", "(")
-                .Replace(")", ")")
+                .Replace("）", ")")
                 .Replace("，", ",");
-            // 跳过注释和空行（// 或 # 开头，或空行）
-            if (l.StartsWith("//") || l.StartsWith('#') || string.IsNullOrEmpty(l))
-            {
+            
+            // 跳过 // 后的内容
+            int commentIdx = l.IndexOf("//");
+            if (commentIdx >= 0)
+                l = l.Substring(0, commentIdx).Trim();
+
+            // 跳过 # 注释和空行
+            if (l.StartsWith('#') || string.IsNullOrEmpty(l))
                 continue;
-            }
 
             result.Add(l);
         }
@@ -88,7 +92,11 @@ public class CombatScriptParser
         {
             // 再次确保跳过注释行（防止外部调用直接传入带注释的行）
             var trimLine = line.Trim();
-            if (trimLine.StartsWith("//") || trimLine.StartsWith('#') || string.IsNullOrEmpty(trimLine))
+            int commentIdx = trimLine.IndexOf("//");
+            if (commentIdx >= 0)
+                trimLine = trimLine.Substring(0, commentIdx).Trim();
+
+            if (trimLine.StartsWith('#') || string.IsNullOrEmpty(trimLine))
                 continue;
             
             var oneLineCombatCommands = ParseLine(trimLine, combatAvatarNames, validate);
