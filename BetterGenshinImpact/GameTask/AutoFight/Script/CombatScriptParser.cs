@@ -60,22 +60,24 @@ public class CombatScriptParser
 
     public static CombatScript ParseContext(string context, bool validate = true)
     {
-        var lines = context.Split(["\r\n", "\r", "\n", ";"], StringSplitOptions.RemoveEmptyEntries);
+        var lines = context.Split(new[] { "\r\n", "\r", "\n", ";" }, StringSplitOptions.RemoveEmptyEntries);
         var result = new List<string>();
+        int lineNumber = 0;
         foreach (var line in lines)
         {
+            lineNumber++;
             var l = line.Trim()
                 .Replace("（", "(")
                 .Replace("）", ")")
                 .Replace("，", ",");
-            
-            // 跳过 // 后的内容
+
+            // 去除行内注释
             int commentIdx = l.IndexOf("//");
             if (commentIdx >= 0)
                 l = l.Substring(0, commentIdx).Trim();
 
             // 跳过 # 注释和空行
-            if (l.StartsWith('#') || string.IsNullOrEmpty(l))
+            if (l.StartsWith("#") || string.IsNullOrEmpty(l))
                 continue;
 
             result.Add(l);
@@ -86,20 +88,22 @@ public class CombatScriptParser
 
     private static CombatScript ParseLines(List<string> lines, bool validate = true)
     {
-        List<CombatCommand> combatCommands = [];
-        HashSet<string> combatAvatarNames = [];
+        List<CombatCommand> combatCommands = new();
+        HashSet<string> combatAvatarNames = new();
+        int lineNumber = 0;
         foreach (var line in lines)
         {
+            lineNumber++;
             // 再次确保跳过注释行（防止外部调用直接传入带注释的行）
             var trimLine = line.Trim();
             int commentIdx = trimLine.IndexOf("//");
             if (commentIdx >= 0)
                 trimLine = trimLine.Substring(0, commentIdx).Trim();
 
-            if (trimLine.StartsWith('#') || string.IsNullOrEmpty(trimLine))
+            if (trimLine.StartsWith("#") || string.IsNullOrEmpty(trimLine))
                 continue;
             
-            var oneLineCombatCommands = ParseLine(trimLine, combatAvatarNames, validate);
+            var oneLineCombatCommands = ParseLine(trimLine, combatAvatarNames, validate, lineNumber);
             combatCommands.AddRange(oneLineCombatCommands);
         }
 
@@ -109,11 +113,11 @@ public class CombatScriptParser
         return new CombatScript(combatAvatarNames, combatCommands);
     }
 
-    private static List<CombatCommand> ParseLine(string line, HashSet<string> combatAvatarNames, bool validate = true)
+    // 增加 lineNumber 参数用于报错时定位
+    private static List<CombatCommand> ParseLine(string line, HashSet<string> combatAvatarNames, bool validate = true, int lineNumber = 0)
     {
         var oneLineCombatCommands = new List<CombatCommand>();
         // 以空格分隔角色和指令 截取第一个空格前的内容为角色名称，后面的为指令
-        // 20241116更新 不输入角色名称时，直接以当前角色为准
         var firstSpaceIndex = line.IndexOf(' ');
         var character = CurrentAvatarName;
         var commands = line;
@@ -127,8 +131,8 @@ public class CombatScriptParser
         {
             if (validate)
             {
-                Logger.LogError("战斗脚本格式错误，必须以空格分隔角色和指令");
-                throw new Exception("战斗脚本格式错误，必须以空格分隔角色和指令");
+                Logger.LogError($"战斗脚本格式错误，第{lineNumber}行内容：【{line}】，必须以空格分隔角色和指令");
+                throw new Exception($"战斗脚本格式错误，第{lineNumber}行内容：【{line}】，必须以空格分隔角色和指令");
             }
         }
 
