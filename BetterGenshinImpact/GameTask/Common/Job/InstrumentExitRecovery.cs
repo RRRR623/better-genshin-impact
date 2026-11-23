@@ -69,7 +69,13 @@ internal static class InstrumentExitRecovery
             var view = ReadScreen(screen, true, out var target);
             using (target)
             {
-                var worldReady = view == InstrumentExitScreen.World && (canResumeInWorld?.Invoke(screen) ?? true);
+                // 识别期间窗口状态可能变化，先确认该帧仍可用，再开始落点核对。
+                var worldReady = view == InstrumentExitScreen.World;
+                if (worldReady && canResumeInWorld != null)
+                {
+                    worldReady = CanObserve(runtime) && viewport == runtime.Window.Viewport.ScreenRect && canResumeInWorld(screen);
+                }
+
                 var sameWorld = worldReady && hasPreviousWorld && previousWorld.Size() == screen.SrcMat.Size()
                     && previousWorld.Type() == screen.SrcMat.Type() && Cv2.Norm(previousWorld, screen.SrcMat, NormTypes.L1) == 0;
                 if (!CanObserve(runtime) || viewport != runtime.Window.Viewport.ScreenRect)

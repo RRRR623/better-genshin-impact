@@ -90,6 +90,7 @@ public class TpTask
     private const int TeleportClickableAreaRetryDelayMs = 80;
     private const int BigMapRectRetryIntervalMs = 150;
     private const int TeleportTimeoutMs = 60_000;
+    private const int InterruptedTeleportArrivalTimeoutMs = 60_000;
     private const double MapPositionRecognitionRecoveryZoomStep = 1.0;
     private static string? s_lastSuccessfulTeleportMapName;
     private double _mapZoomLevelPerWheelNotch = DefaultMapZoomLevelPerWheelNotch;
@@ -1034,10 +1035,7 @@ public class TpTask
             {
                 if (!_confirmationSent) throw new InstrumentBeforeTeleportConfirmationException();
 
-                var departure = _departureMinimap == null ? null : ReadInterruptedTeleportPosition(_departureMinimap, target.MapName);
-                // 原确认仍在等待。恢复过程只观察同一次传送，不能回到开图或确认阶段。
-                await InstrumentExitRecovery.RecoverAsync(_confirmedRuntime, waitCancellation,
-                    world => IsAtInterruptedTeleportDestination(world, target, departure));
+                await WaitForInterruptedTeleportArrival(target, waitCancellation);
                 Logger.LogInformation("传送完成");
                 return;
             }
@@ -1093,6 +1091,32 @@ public class TpTask
             throw new TimeoutException("已发送传送确认，但在等待时限内未识别到传送完成");
 
         Logger.LogWarning("传送等待超时，换台电脑吧");
+    }
+
+    private async Task WaitForInterruptedTeleportArrival(TeleportTargetContext target, CancellationToken routeCancellation)
+    {
+        var departure = _departureMinimap == null ? null : ReadInterruptedTeleportPosition(_departureMinimap, target.MapName);
+        using var arrivalCancellation = CancellationTokenSource.CreateLinkedTokenSource(routeCancellation);
+        var arrivalCheckStarted = false;
+
+        try
+        {
+            // 只核对已经发出的传送。从首次识别到大世界开始计时，给退出演奏和过场留出时间。
+            await InstrumentExitRecovery.RecoverAsync(_confirmedRuntime, arrivalCancellation.Token, world =>
+            {
+                if (!arrivalCheckStarted)
+                {
+                    arrivalCheckStarted = true;
+                    arrivalCancellation.CancelAfter(InterruptedTeleportArrivalTimeoutMs);
+                }
+
+                return IsAtInterruptedTeleportDestination(world, target, departure);
+            });
+        }
+        catch (OperationCanceledException e) when (arrivalCancellation.IsCancellationRequested && !routeCancellation.IsCancellationRequested)
+        {
+            throw new TimeoutException("退出演奏后未能在时限内确认原传送落点，保留当前步骤", e);
+        }
     }
 
     private Point2f? ReadInterruptedTeleportPosition(Mat minimap, string mapName)
