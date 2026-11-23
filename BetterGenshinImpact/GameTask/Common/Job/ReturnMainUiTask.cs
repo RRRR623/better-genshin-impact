@@ -15,10 +15,10 @@ public class ReturnMainUiTask
 
     public async Task Start(CancellationToken ct)
     {
-        using var initialCapture = CaptureToRectArea();
-        if (Bv.IsInMainUi(initialCapture))
+        using (var initialCapture = CaptureToRectArea())
         {
-            return;
+            if (await InstrumentExitRecovery.TryExitAsync(initialCapture, ct) || Bv.IsInMainUi(initialCapture))
+                return;
         }
 
         for (var i = 0; i < 8; i++)
@@ -30,18 +30,18 @@ public class ReturnMainUiTask
 
             try
             {
-                var exitDoor = region.Find(ElementRecognition.Get("BtnExitDoor", region));
+                if (await InstrumentExitRecovery.TryExitAsync(region, ct) || Bv.IsInMainUi(region))
+                    return;
+
+                using var exitDoor = region.Find(ElementRecognition.Get("BtnExitDoor", region));
                 if (exitDoor.IsExist())
                 {
                     exitDoor.Click();
                     await Delay(5000, ct);
                     region.Dispose();
                     region = CaptureToRectArea();
-                }
-
-                if (Bv.IsInMainUi(region))
-                {
-                    return;
+                    if (await InstrumentExitRecovery.TryExitAsync(region, ct) || Bv.IsInMainUi(region))
+                        return;
                 }
             }
             finally
@@ -50,8 +50,16 @@ public class ReturnMainUiTask
             }
         }
         await Delay(500, ct);
+        using (var beforeEnter = CaptureToRectArea())
+        {
+            if (await InstrumentExitRecovery.TryExitAsync(beforeEnter, ct) || Bv.IsInMainUi(beforeEnter))
+                return;
+        }
+
         InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_RETURN);
         await Delay(500, ct);
-        InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+        using var beforeEscape = CaptureToRectArea();
+        if (!await InstrumentExitRecovery.TryExitAsync(beforeEscape, ct) && !Bv.IsInMainUi(beforeEscape))
+            InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
     }
 }
