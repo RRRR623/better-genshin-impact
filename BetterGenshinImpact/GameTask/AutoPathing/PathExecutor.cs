@@ -685,14 +685,9 @@ public partial class PathExecutor
     /// <summary>
     /// 尝试自动领取派遣奖励，
     /// </summary>
-    /// <returns>是否可以领取派遣奖励</returns>
-    private async Task<bool> TryGetExpeditionRewardsDispatch(TpTask? tpTask = null)
+    /// <returns>是否执行过派遣路线</returns>
+    private async Task<bool> TryGetExpeditionRewardsDispatch(Func<Task> openMap)
     {
-        if (tpTask == null)
-        {
-            tpTask = new TpTask(ct);
-        }
-        
         // 最小5分钟间隔
         if ( _combatScenes?.CurrentMultiGameStatus?.IsInMultiGame == true || (DateTime.UtcNow - _lastGetExpeditionRewardsTime).TotalMinutes < 5)
         {
@@ -700,7 +695,7 @@ public partial class PathExecutor
         }
 
         //打开大地图操作
-        await tpTask.OpenBigMapUi();
+        await openMap();
         bool changeBigMap = false;
         string adventurersGuildCountry =
             TaskContext.Instance().Config.OtherConfig.AutoFetchDispatchAdventurersGuildCountry;
@@ -740,9 +735,13 @@ public partial class PathExecutor
     private async Task HandleTeleportWaypoint(WaypointForTrack waypoint)
     {
         var forceTp = waypoint.Action == ActionEnum.ForceTp.Code;
-        var tpTask = new TpTask(ct) { InstrumentQuest = waypoint.InstrumentQuest };
-        await TryGetExpeditionRewardsDispatch(tpTask);
-        var (tpX, tpY) = await tpTask.Tp(waypoint.GameX, waypoint.GameY, waypoint.MapName, forceTp);
+        var tpTask = new TpTask(ct)
+        {
+            InstrumentQuest = waypoint.InstrumentQuest,
+            ArrivalMapMatchMethod = waypoint.MapMatchMethod
+        };
+        var (tpX, tpY) = await tpTask.TpWaypoint(waypoint.GameX, waypoint.GameY, waypoint.MapName, forceTp,
+            TryGetExpeditionRewardsDispatch);
         var (tprX, tprY) = MapManager.GetMap(waypoint.MapName, waypoint.MapMatchMethod)
             .ConvertGenshinMapCoordinatesToImageCoordinates(new Point2f((float)tpX, (float)tpY));
         Navigation.SetPrevPosition(tprX, tprY); // 通过上一个位置直接进行局部特征匹配
@@ -763,6 +762,31 @@ public partial class PathExecutor
     }
 
     public DateTime moveToStartTime;
+    private readonly object _movementTimingLock = new();
+    private long _movementTimeoutResetAt;
+    private TimeSpan _switchRecoveryWait;
+
+    internal void ResetMovementTimeout()
+    {
+        lock (_movementTimingLock)
+        {
+            moveToStartTime = DateTime.UtcNow;
+            _movementTimeoutResetAt = Stopwatch.GetTimestamp();
+            _switchRecoveryWait = TimeSpan.Zero;
+        }
+    }
+
+    private bool HasMovementTimedOut()
+    {
+        lock (_movementTimingLock)
+            return DateTime.UtcNow - moveToStartTime - _switchRecoveryWait > TimeSpan.FromSeconds(240);
+    }
+
+    private void ExcludeSwitchRecoveryWait(long started)
+    {
+        lock (_movementTimingLock)
+            _switchRecoveryWait += Stopwatch.GetElapsedTime(Math.Max(started, _movementTimeoutResetAt));
+    }
 
     public async Task MoveTo(WaypointForTrack waypoint)
     {
@@ -780,7 +804,7 @@ public partial class PathExecutor
         var targetOrientation = Navigation.GetTargetOrientation(waypoint, position);
         Logger.LogDebug("粗略接近途经点，位置({x2},{y2})", $"{waypoint.GameX:F1}", $"{waypoint.GameY:F1}");
         await WaitUntilRotatedTo(waypoint, targetOrientation, 5);
-        moveToStartTime = DateTime.UtcNow;
+        ResetMovementTimeout();
         var lastPositionRecord = DateTime.UtcNow;
         var fastMode = false;
         var prevPositions = new List<Point2f>();
@@ -798,7 +822,7 @@ public partial class PathExecutor
         while (!ct.IsCancellationRequested)
         {
             num++;
-            if ((DateTime.UtcNow - moveToStartTime).TotalSeconds > 240)
+            if (HasMovementTimedOut())
             {
                 Logger.LogWarning("执行超时，放弃此次追踪");
                 throw new RetryException("路径点执行超时，放弃整条路径");
@@ -875,7 +899,7 @@ public partial class PathExecutor
                                 var restored = await WaitForInstrumentPosition(waypoint);
                                 targetOrientation = Navigation.GetTargetOrientation(waypoint, restored);
                                 await WaitUntilRotatedTo(waypoint, targetOrientation, 5);
-                                moveToStartTime = DateTime.UtcNow;
+                                ResetMovementTimeout();
                                 lastPositionRecord = moveToStartTime;
                                 prevPositions.Clear();
                                 distanceTooFarRetryCount = 0;
@@ -1092,7 +1116,7 @@ public partial class PathExecutor
 
         // 切人
         Logger.LogInformation("切换盾、回血角色，使用元素战技");
-        var avatar = await SwitchAvatar(PartyConfig.GuardianAvatarIndex, waypoint, true);
+        var avatar = await SwitchAvatar(PartyConfig.GuardianAvatarIndex, waypoint, needSkill: true, excludeRecoveryWait: true);
         if (avatar == null)
         {
             return;
@@ -1103,12 +1127,12 @@ public partial class PathExecutor
         {
             InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
             await Delay(50, ct);
-            if (!await ConfirmWaypointAvatar(avatar, waypoint)) return;
+            if (!await ConfirmWaypointAvatar(avatar, waypoint, excludeRecoveryWait: true)) return;
             InputHub.Foreground.SimulateAction(GIActions.MoveBackward);
             await Delay(200, ct);
         }
 
-        if (!await ConfirmWaypointAvatar(avatar, waypoint)) return;
+        if (!await ConfirmWaypointAvatar(avatar, waypoint, excludeRecoveryWait: true)) return;
         avatar.UseSkill(PartyConfig.GuardianElementalSkillLongPress);
 
         // 钟离往身后放柱子 后继续走路
@@ -1221,14 +1245,24 @@ public partial class PathExecutor
         }
     }
 
-    private Task<bool> TrySwitchWaypointAvatar(Avatar avatar, WaypointForTrack waypoint, int tries = 4) =>
-        RunnerContext.TrySwitchWaypointAvatarAsync(avatar, tries, ct, waypoint.InstrumentQuest, VerifyMovementScreen(waypoint));
+    private Task<bool> TrySwitchWaypointAvatar(Avatar avatar, WaypointForTrack waypoint, int tries = 4,
+        bool excludeRecoveryWait = false) =>
+        RunnerContext.TrySwitchWaypointAvatarAsync(avatar, tries, ct, waypoint.InstrumentQuest,
+            VerifyMovementScreen(waypoint), excludeRecoveryWait ? ExcludeSwitchRecoveryWait : null);
 
-    private async Task<bool> ConfirmWaypointAvatar(Avatar avatar, WaypointForTrack waypoint) =>
-        !VerifyMovementScreen(waypoint) || !await RunnerContext.EnsureWaypointActionWorldAsync(ct, waypoint.InstrumentQuest)
-        || await TrySwitchWaypointAvatar(avatar, waypoint);
+    private async Task<bool> ConfirmWaypointAvatar(Avatar avatar, WaypointForTrack waypoint, bool excludeRecoveryWait = false)
+    {
+        if (!VerifyMovementScreen(waypoint)) return true;
+        var started = Stopwatch.GetTimestamp();
+        if (!await RunnerContext.EnsureWaypointActionWorldAsync(ct, waypoint.InstrumentQuest, recoverRevivePrompt: true))
+            return true;
 
-    private async Task<Avatar?> SwitchAvatar(string index, WaypointForTrack? waypoint, bool needSkill = false)
+        if (excludeRecoveryWait) ExcludeSwitchRecoveryWait(started);
+        return await TrySwitchWaypointAvatar(avatar, waypoint, excludeRecoveryWait: excludeRecoveryWait);
+    }
+
+    private async Task<Avatar?> SwitchAvatar(string index, WaypointForTrack? waypoint, bool needSkill = false,
+        bool excludeRecoveryWait = false)
     {
         if (string.IsNullOrEmpty(index))
         {
@@ -1243,7 +1277,9 @@ public partial class PathExecutor
             return null;
         }
 
-        var success = waypoint == null ? avatar.TrySwitch(5) : await TrySwitchWaypointAvatar(avatar, waypoint, 5);
+        var success = waypoint == null
+            ? avatar.TrySwitch(5)
+            : await TrySwitchWaypointAvatar(avatar, waypoint, 5, excludeRecoveryWait);
         if (success)
         {
             await Delay(100, ct);

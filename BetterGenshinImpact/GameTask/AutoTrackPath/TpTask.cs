@@ -18,6 +18,7 @@ using BetterGenshinImpact.GameTask.Common.Map.Maps.Base;
 using BetterGenshinImpact.GameTask.Model.Area;
 using BetterGenshinImpact.GameTask.Music.Service;
 using BetterGenshinImpact.GameTask.QuickTeleport.Assets;
+using BetterGenshinImpact.GameTask.Runtime;
 using BetterGenshinImpact.Helpers;
 using BetterGenshinImpact.Helpers.Extensions;
 using Fischless.GameCapture;
@@ -52,6 +53,7 @@ public class TpTask
     private CancellationToken? RouteCancellation { get; init; }
     private bool GuardDepartureOnly { get; init; }
     internal InstrumentQuestRecovery? InstrumentQuest { get; set; }
+    internal string? ArrivalMapMatchMethod { get; init; }
     private readonly CultureInfo cultureInfo;
     private readonly IStringLocalizer stringLocalizer;
 
@@ -90,6 +92,7 @@ public class TpTask
     private const int TeleportClickableAreaRetryDelayMs = 80;
     private const int BigMapRectRetryIntervalMs = 150;
     private const int TeleportTimeoutMs = 60_000;
+    private const double TeleportArrivalTolerance = 12d;
     private const double MapPositionRecognitionRecoveryZoomStep = 1.0;
     private static string? s_lastSuccessfulTeleportMapName;
     private double _mapZoomLevelPerWheelNotch = DefaultMapZoomLevelPerWheelNotch;
@@ -105,6 +108,7 @@ public class TpTask
         public required Rect IconRect { get; init; }
         public required Rect TextRect { get; init; }
         public required Rect ClickRect { get; init; }
+        public bool MatchesTarget { get; set; }
     }
 
     private sealed class NearbyMapIcon
@@ -152,7 +156,7 @@ public class TpTask
         public required double MeanError { get; init; }
     }
 
-    private readonly record struct AbsoluteMapClickCandidate(double ClickX, double ClickY);
+    private readonly record struct AbsoluteMapClickCandidate(double ClickX, double ClickY, GiTpPosition? Anchor);
 
     private enum AbsoluteMapClickFailure
     {
@@ -166,6 +170,12 @@ public class TpTask
     {
     }
 
+    private sealed class TeleportDepartureProbe(string mapName)
+    {
+        public string MapName { get; } = mapName;
+        public (GameRuntime Runtime, Point2f Position)? Origin { get; set; }
+    }
+
     private sealed class TeleportTargetContext
     {
         public required string MapName { get; init; }
@@ -173,6 +183,9 @@ public class TpTask
         public double RequestX { get; init; }
         public double RequestY { get; init; }
         public required GiTpPosition TargetTp { get; init; }
+        public GiTpPosition? SelectedAnchor { get; set; }
+        public bool SelectionFromList { get; set; }
+        public Point2f? DeparturePosition { get; set; }
         public required GiTpPosition NearTp { get; init; }
         public double X { get; init; }
         public double Y { get; init; }
@@ -358,7 +371,12 @@ public class TpTask
     ///释放所有按键，并打开大地图界面
     /// </summary>
     /// <param name="retryCount">重试次数</param>
-    public async Task OpenBigMapUi(int retryCount = 3, string? mapName = null)
+    public Task OpenBigMapUi(int retryCount = 3, string? mapName = null)
+    {
+        return OpenBigMapUiCore(retryCount, mapName, null);
+    }
+
+    private async Task OpenBigMapUiCore(int retryCount, string? mapName, TeleportDepartureProbe? departure)
     {
         for (var i = 0; i < retryCount; i++)
         {
@@ -370,7 +388,7 @@ public class TpTask
                 else
                     await InstrumentExitRecovery.ReleasePressedKeysAsync(TaskContext.Instance().Runtime!, ct);
                 await Delay(GetTeleportOperationDelay(20), ct);
-                await CheckInBigMapUi(mapName);
+                await CheckInBigMapUiCore(mapName, departure);
                 return;
             }
             catch (Exception e) when (IsTaskStopException(e))
@@ -402,23 +420,28 @@ public class TpTask
     private async Task<(double, double)> TpOnce(
         double tpX,
         double tpY,
-        string mapName = "Teyvat",
-        bool force = false)
+        string mapName,
+        bool force,
+        TeleportDepartureProbe? departure)
     {
         ClearRememberedAreaSwitchCenterPoint();
 
         // 1. 确认在地图界面，并在传送入口统一切回地表图层
-        await OpenBigMapUi(1, mapName);
+        await OpenBigMapUiCore(1, mapName, departure);
         await SwitchToGroundMapLayerIfNeeded();
 
         var target = ResolveTeleportTarget(tpX, tpY, mapName, force);
+        if (departure?.Origin is { } origin && ReferenceEquals(origin.Runtime, TaskContext.Instance().Runtime))
+            target.DeparturePosition = origin.Position;
         LogTeleportTarget(target);
         await SwitchToTeleportTargetMap(target);
 
         var clickView = await PrepareTeleportClickView(target);
         var fallbackCandidate = ClickTeleportTargetMapPoint(target, clickView);
         await ClickTpPointAfterMapPointSelected(target, fallbackCandidate);
-        await WaitForTeleportCompletion();
+        // 确认键已发出。后续尝试必须重新观察开图前的出发位置。
+        if (departure != null) departure.Origin = null;
+        await WaitForTeleportCompletion(target);
 
         s_lastSuccessfulTeleportMapName = target.MapName;
         return (target.X, target.Y);
@@ -871,8 +894,10 @@ public class TpTask
                 out var clickX,
                 out var clickY,
                 out var failureReason,
-                out var failure))
+                out var failure,
+                out var alignment))
         {
+            target.SelectedAnchor = ReadForcedClickAnchor(target, alignment, clickX, clickY);
             clickCapture.ClickTo(clickX, clickY);
             return null;
         }
@@ -881,8 +906,9 @@ public class TpTask
         // 若面板未出现，调用方会在不移动地图的前提下回退到本次已算出的候选校正点。
         if (failure == AbsoluteMapClickFailure.NeighborSafetyDistance)
         {
+            target.SelectedAnchor = ReadForcedClickAnchor(target, alignment, clickView.ClickX, clickView.ClickY);
             clickCapture.ClickTo(clickView.ClickX, clickView.ClickY);
-            return new AbsoluteMapClickCandidate(clickX, clickY);
+            return new AbsoluteMapClickCandidate(clickX, clickY, ReadForcedClickAnchor(target, alignment, clickX, clickY));
         }
 
         Logger.LogWarning("目标传送点绝对坐标定位失败：{Reason}", failureReason);
@@ -926,7 +952,7 @@ public class TpTask
         AbsoluteMapClickCandidate? fallbackCandidate)
     {
         // 点完地图后等右侧面板：传送按钮、候选列表，或未激活点/标点详情。
-        if (await WaitForTeleportPanelAndConfirm(target.TargetTp))
+        if (await WaitForTeleportPanelAndConfirm(target))
         {
             return;
         }
@@ -935,7 +961,8 @@ public class TpTask
         {
             // 原始点和候选点不同，允许回退一次；不再重新计算并重复点击同一点。
             ClickAbsoluteMapCandidate(candidate);
-            if (await WaitForTeleportPanelAndConfirm(target.TargetTp))
+            target.SelectedAnchor = candidate.Anchor;
+            if (await WaitForTeleportPanelAndConfirm(target))
             {
                 return;
             }
@@ -946,7 +973,7 @@ public class TpTask
         throw new TeleportPanelNotOpenedException("点击传送点后未出现交互面板，可能是传送点未激活");
     }
 
-    private async Task<bool> WaitForTeleportPanelAndConfirm(GiTpPosition? targetTp)
+    private async Task<bool> WaitForTeleportPanelAndConfirm(TeleportTargetContext target)
     {
         var configuredDelay = TaskContext.Instance().Config.QuickTeleportConfig.WaitTeleportPanelDelay;
         var configuredWait = Math.Clamp(configuredDelay <= 0 ? 50 : configuredDelay, 50, 300);
@@ -962,7 +989,7 @@ public class TpTask
         for (var attempt = 0; attempt < maxAttemptCount; attempt++)
         {
             using var teleportCapture = CaptureToRectArea();
-            var result = await HandleTeleportPanel(teleportCapture, targetTp);
+            var result = await HandleTeleportPanel(teleportCapture, target);
             switch (result)
             {
                 case TeleportPanelResult.Confirmed:
@@ -1022,8 +1049,17 @@ public class TpTask
     /// <summary>
     ///     检查传送是否完成，未完成则等待
     /// </summary>
-    private async Task WaitForTeleportCompletion()
+    private async Task WaitForTeleportCompletion(TeleportTargetContext destination)
     {
+        if (InstrumentQuest != null)
+        {
+            // 标记路线已发出确认键。只有定位到目的地才提交传送结果，未知界面不能当作加载证据。
+            await WaitForTeleportArrivalAsync(destination, RouteCancellation ?? ct,
+                GuardDepartureOnly ? null : InstrumentQuest);
+            Logger.LogInformation("传送完成");
+            return;
+        }
+
         var observedLoadingState = false;
         var consecutiveNonUiChecks = 0;
         var consecutiveMainUiChecks = 0;
@@ -1034,26 +1070,7 @@ public class TpTask
 
             var capture = CaptureToRectArea();
             using var ownedCapture = capture;
-            InstrumentExitScreen? markedScreen = null;
-            if (InstrumentQuest != null)
-            {
-                markedScreen = InstrumentExitRecovery.ReadScreen(capture, true, out var target,
-                    durinKeyboard: DurinScoreVision.HasKeyboard(capture.SrcMat), classifyWelkin: true);
-                target?.Dispose();
-                if (markedScreen is InstrumentExitScreen.BlockedPrompt or InstrumentExitScreen.WelkinReward
-                    or InstrumentExitScreen.InstrumentPage or InstrumentExitScreen.ExitPrompt)
-                {
-                    // 标记点只有实际发出确认键才能走到这里。保留已请求的传送与路线取消令牌。
-                    var routeToken = RouteCancellation ?? ct;
-                    var quest = GuardDepartureOnly ? null : InstrumentQuest;
-                    if (markedScreen is (InstrumentExitScreen.InstrumentPage or InstrumentExitScreen.ExitPrompt)
-                        && await InstrumentExitRecovery.TryExitAsync(capture, routeToken, instrumentOnly: true, quest: quest))
-                        return;
-                    await RecoverConfirmedTeleportAsync(routeToken, quest);
-                    return;
-                }
-            }
-            var isInMainUi = markedScreen.HasValue ? markedScreen == InstrumentExitScreen.World : Bv.IsInMainUi(capture);
+            var isInMainUi = Bv.IsInMainUi(capture);
 
             if (isInMainUi)
             {
@@ -1070,7 +1087,7 @@ public class TpTask
             {
                 consecutiveMainUiChecks = 0;
                 var isInBigMapUi = Bv.IsInBigMapUi(capture);
-                if (InstrumentQuest == null && !isInBigMapUi)
+                if (!isInBigMapUi)
                 {
                     // 加载中只观察；明确看到演奏界面才由外层在传送时限之外处理。
                     var view = InstrumentExitRecovery.ReadScreen(capture, true, out var target);
@@ -1101,7 +1118,7 @@ public class TpTask
             }
 
             // 打开大地图期间推送的月卡会在传送之后直接显示，导致检测不到传送完成。
-            if (InstrumentQuest == null && observedLoadingState && !isInMainUi && blessingCheckCountdown == 0)
+            if (observedLoadingState && !isInMainUi && blessingCheckCountdown == 0)
             {
                 await _blessingOfTheWelkinMoonTask.Start(ct);
                 ct.ThrowIfCancellationRequested();
@@ -1112,16 +1129,90 @@ public class TpTask
         Logger.LogWarning("传送等待超时，换台电脑吧");
     }
 
-    private static async Task RecoverConfirmedTeleportAsync(CancellationToken ct, InstrumentQuestRecovery? quest)
+    private async Task WaitForTeleportArrivalAsync(TeleportTargetContext destination, CancellationToken ct,
+        InstrumentQuestRecovery? quest)
     {
         var runtime = TaskContext.Instance().Runtime;
         while (!await InstrumentExitRecovery.WaitForWorldOrInstrumentAsync(runtime,
-                   "已请求传送，等待确认回到大世界", ct, quest))
+                   "已请求传送，等待核对目的地", ct, quest, screen => IsAtTeleportDestination(screen, destination)))
         {
-            using var screen = CaptureToRectArea();
-            if (await InstrumentExitRecovery.TryExitAsync(screen, ct, instrumentOnly: true, quest: quest))
-                return;
+            using var frame = await InstrumentExitRecovery.CaptureFreshForInputAsync(runtime, ct);
+            if (frame != null)
+                await InstrumentExitRecovery.TryExitAsync(frame.CaptureRectArea, ct, instrumentOnly: true, quest: quest);
         }
+
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private bool IsAtTeleportDestination(ImageRegion screen, TeleportTargetContext destination)
+    {
+        var position = ReadTeleportPosition(screen, destination.MapName);
+        if (position is not { } current) return false;
+
+        var anchor = destination.Force ? destination.SelectedAnchor : destination.TargetTp;
+        if (anchor == null && destination.SelectionFromList && GetRequestedForcedLanding(destination) is { } landing)
+            return IsVerifiedForcedLanding(current, destination, landing);
+
+        var (x, y) = anchor == null ? (destination.X, destination.Y) : GetTeleportLandingPoint(anchor);
+        return GetDistance(current.X, current.Y, x, y) <= TeleportArrivalTolerance;
+    }
+
+    private void ObserveTeleportDeparture(ImageRegion screen, GameRuntime runtime, TeleportDepartureProbe departure)
+    {
+        departure.Origin = null;
+        try
+        {
+            if (ReadTeleportPosition(screen, departure.MapName) is { } position)
+                departure.Origin = (runtime, position);
+        }
+        catch (Exception e) when (!IsTaskStopException(e))
+        {
+            Logger.LogDebug(e, "未能识别开图前的出发坐标");
+        }
+    }
+
+    private Point2f? ReadTeleportPosition(ImageRegion screen, string mapName)
+    {
+        var map = MapManager.GetMap(mapName, ArrivalMapMatchMethod ?? _mapMatchingMethod);
+        using var minimap = new Mat(screen.SrcMat, MapAssets.Get(screen).MimiMapRect);
+        var match = map is SceneBaseMapByTemplateMatch templateMap
+            ? templateMap.VerifyMiniMapPosition(minimap)
+            : map.GetMiniMapPosition(minimap);
+        var position = map.ConvertImageCoordinatesToGenshinMapCoordinates(match);
+        return position is { } current && IsFinite(current.X) && IsFinite(current.Y) ? current : null;
+    }
+
+    private static (double X, double Y) GetTeleportLandingPoint(GiTpPosition anchor)
+    {
+        return anchor.TranPosition is { Length: >= 3 } spawn && spawn.Any(value => value != 0)
+            ? (anchor.TranX, anchor.TranY)
+            : (anchor.X, anchor.Y);
+    }
+
+    private static (double X, double Y)? GetRequestedForcedLanding(TeleportTargetContext target)
+    {
+        if (!target.Force || GetDistance(target.X, target.Y, target.TargetTp.X, target.TargetTp.Y) > 1d)
+            return null;
+
+        var landing = GetTeleportLandingPoint(target.TargetTp);
+        return GetDistance(target.X, target.Y, landing.X, landing.Y) > TeleportArrivalTolerance ? landing : null;
+    }
+
+    private static bool IsVerifiedForcedLanding(Point2f current, TeleportTargetContext target, (double X, double Y) landing)
+    {
+        if (target.DeparturePosition is not { } departure
+            || GetDistance(departure.X, departure.Y, landing.X, landing.Y) <= TeleportArrivalTolerance
+            || GetDistance(departure.X, departure.Y, current.X, current.Y) <= TeleportArrivalTolerance
+            || GetDistance(current.X, current.Y, landing.X, landing.Y) > TeleportArrivalTolerance)
+            return false;
+
+        // 重叠列表的文字和图标可能相同，用出发与到达坐标独立验证路线指定的落点。
+        return !MapLazyAssets.Get().ScenesDic[target.MapName].Points.Any(point =>
+        {
+            if (point == target.TargetTp) return false;
+            var alternative = GetTeleportLandingPoint(point);
+            return GetDistance(current.X, current.Y, alternative.X, alternative.Y) <= TeleportArrivalTolerance;
+        });
     }
 
     private bool IsGameRegionPointInClickableArea(double clickX, double clickY, double requiredVisibleRadius = 0)
@@ -1211,15 +1302,20 @@ public class TpTask
         return (clickX, clickY);
     }
 
-    public async Task CheckInBigMapUi(string? mapName = null)
+    public Task CheckInBigMapUi(string? mapName = null)
+    {
+        return CheckInBigMapUiCore(mapName, null);
+    }
+
+    private async Task CheckInBigMapUiCore(string? mapName, TeleportDepartureProbe? departure)
     {
         // 尝试打开地图失败后，先回到主界面后再次尝试打开地图
-        if (!await TryToOpenBigMapUi(mapName))
+        if (!await TryToOpenBigMapUi(mapName, departure))
         {
             if (InstrumentQuest == null)
                 await new ReturnMainUiTask().Start(ct, waitForWorld: !IsTimedTeleportAttempt);
             await Delay(500, ct);
-            if (!await TryToOpenBigMapUi(mapName))
+            if (!await TryToOpenBigMapUi(mapName, departure))
             {
                 throw new RetryException("打开大地图失败，请检查按键绑定中「打开地图」按键设置是否和原神游戏中一致！");
             }
@@ -1229,17 +1325,21 @@ public class TpTask
     /// <summary>
     /// 尝试打开地图界面
     /// </summary>
-    private async Task<bool> TryToOpenBigMapUi(string? mapName)
+    private async Task<bool> TryToOpenBigMapUi(string? mapName, TeleportDepartureProbe? departure)
     {
         if (InstrumentQuest is { } quest)
         {
             var runtime = TaskContext.Instance().Runtime;
             var closedMenus = 0;
+            Action<ImageRegion>? observe = departure == null
+                ? null : screen => ObserveTeleportDeparture(screen, runtime!, departure);
             while (true)
             {
-                var action = await InstrumentExitRecovery.ActOnFreshMenuAsync(runtime, ct, openMap: true);
+                var action = await InstrumentExitRecovery.ActOnFreshMenuAsync(runtime, ct, openMap: true,
+                    observeDeparture: observe);
                 if (action == InstrumentExitRecovery.MenuAction.MapAlreadyOpen) return true;
                 if (action == InstrumentExitRecovery.MenuAction.MapRequested) break;
+                if (departure != null) departure.Origin = null;
                 if (action == InstrumentExitRecovery.MenuAction.Closed)
                 {
                     await Delay(900, ct);
@@ -1300,7 +1400,27 @@ public class TpTask
     }
 
 
+    internal async Task<(double, double)> TpWaypoint(double tpX, double tpY, string mapName, bool force,
+        Func<Func<Task>, Task<bool>> checkExpedition)
+    {
+        var departure = CreateTeleportDepartureProbe(tpX, tpY, mapName, force);
+        if (await checkExpedition(() => OpenBigMapUiCore(3, null, departure)) && departure != null)
+            departure.Origin = null;
+        return await TpCore(tpX, tpY, mapName, force, departure);
+    }
+
     public async Task<(double, double)> Tp(double tpX, double tpY, string mapName = "Teyvat", bool force = false)
+    {
+        return await TpCore(tpX, tpY, mapName, force, CreateTeleportDepartureProbe(tpX, tpY, mapName, force));
+    }
+
+    private TeleportDepartureProbe? CreateTeleportDepartureProbe(double tpX, double tpY, string mapName, bool force)
+    {
+        return InstrumentQuest != null && force && GetRequestedForcedLanding(ResolveTeleportTarget(tpX, tpY, mapName, force)) != null
+            ? new TeleportDepartureProbe(mapName) : null;
+    }
+
+    private async Task<(double, double)> TpCore(double tpX, double tpY, string mapName, bool force, TeleportDepartureProbe? departure)
     {
         var runtime = TaskContext.Instance().Runtime;
         while (true)
@@ -1316,10 +1436,11 @@ public class TpTask
                     {
                         IsTimedTeleportAttempt = true,
                         InstrumentQuest = InstrumentQuest,
+                        ArrivalMapMatchMethod = ArrivalMapMatchMethod,
                         GuardDepartureOnly = GuardDepartureOnly,
                         RouteCancellation = ct
                     }
-                        .TpWithRetries(tpX, tpY, mapName, force);
+                        .TpWithRetries(tpX, tpY, mapName, force, departure);
                 }
                 catch (OperationCanceledException e) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
                 {
@@ -1328,6 +1449,7 @@ public class TpTask
             }
             catch (InstrumentExitRecoveryException e)
             {
+                if (departure != null) departure.Origin = null;
                 if (e.AllowOrdinaryMenu)
                 {
                     await InstrumentExitRecovery.WaitForMapInputAsync(runtime, e.Message, ct, InstrumentQuest);
@@ -1352,13 +1474,14 @@ public class TpTask
         }
     }
 
-    private async Task<(double, double)> TpWithRetries(double tpX, double tpY, string mapName, bool force)
+    private async Task<(double, double)> TpWithRetries(double tpX, double tpY, string mapName, bool force,
+        TeleportDepartureProbe? departure)
     {
         for (var i = 0; i < 3; i++)
         {
             try
             {
-                return await TpOnce(tpX, tpY, mapName, force);
+                return await TpOnce(tpX, tpY, mapName, force, departure);
             }
             catch (TeleportPanelNotOpenedException e)
             {
@@ -2760,8 +2883,9 @@ public class TpTask
 
     private async Task<TeleportPanelResult> HandleTeleportPanel(
         ImageRegion imageRegion,
-        GiTpPosition? targetTp)
+        TeleportTargetContext target)
     {
+        var targetTp = target.TargetTp;
         // 标记路线必须实际发送确认键，其他传送沿用原有的离图处理。
         RequireTeleportMapForMarkedRoute(imageRegion);
         var isInBigMapUi = Bv.IsInBigMapUi(imageRegion);
@@ -2791,7 +2915,15 @@ public class TpTask
         // 4. 已点选项列表中的传送点（未激活点位也会出现在列表里），等待传送按钮。
         for (var clickAttempt = 1; clickAttempt <= MapChooseCandidateClickRetryCount; clickAttempt++)
         {
+            var selectedAnchor = target.Force && InstrumentQuest != null
+                ? ReadForcedCandidateAnchor(target, candidate)
+                : null;
             var result = await WaitAndPressTeleportConfirm(targetTp);
+            if (result == TeleportPanelResult.Confirmed && target.Force && InstrumentQuest != null)
+            {
+                target.SelectedAnchor = selectedAnchor;
+                target.SelectionFromList = true;
+            }
             if (result is TeleportPanelResult.Confirmed or TeleportPanelResult.LeftMap)
             {
                 return result;
@@ -2865,8 +2997,11 @@ public class TpTask
 
     private async Task PressTeleportConfirmKey()
     {
+        ct.ThrowIfCancellationRequested();
         InputHub.Foreground.Keyboard.KeyPress(User32.VK.VK_F);
-        await Delay(30, ct);
+        // 标记传送在可取消的落点观察循环里等待下一帧。
+        if (InstrumentQuest == null)
+            await Delay(30, ct);
     }
 
     private List<NearbyMapIcon> GetMapIconsInRect(
@@ -2969,7 +3104,8 @@ public class TpTask
         out double clickX,
         out double clickY,
         out string failureReason,
-        out AbsoluteMapClickFailure failure)
+        out AbsoluteMapClickFailure failure,
+        out AbsoluteMapIconAlignment alignment)
     {
         var expectedIcons = GetVisibleExpectedMapIcons(target.MapName, clickView.BigMapInAllMapRect);
         var observedIcons = GetVisibleMapIcons(
@@ -2977,7 +3113,7 @@ public class TpTask
             clickView.ClickX,
             clickView.ClickY,
             expectedIcons);
-        var alignment = EstimateAbsoluteMapIconAlignment(expectedIcons, observedIcons);
+        alignment = EstimateAbsoluteMapIconAlignment(expectedIcons, observedIcons);
         (clickX, clickY) = alignment.Transform.Apply(clickView.ClickX, clickView.ClickY);
 
         var uncertainty = GetAbsoluteMapClickUncertainty(alignment);
@@ -3010,6 +3146,29 @@ public class TpTask
         }
 
         return failureReason.Length == 0;
+    }
+
+    private GiTpPosition? ReadForcedClickAnchor(TeleportTargetContext target, AbsoluteMapIconAlignment alignment,
+        double clickX, double clickY)
+    {
+        if (!target.Force || InstrumentQuest == null) return null;
+        var hits = alignment.Pairs
+            .Where(pair => pair.Observed.Rect.Contains((int)Math.Round(clickX), (int)Math.Round(clickY)))
+            .Take(2).ToArray();
+        return hits.Length == 1 && hits[0].Expected.Tp == target.TargetTp ? target.TargetTp : null;
+    }
+
+    private static GiTpPosition? ReadForcedCandidateAnchor(TeleportTargetContext target, MapChooseCandidate candidate)
+    {
+        if (!candidate.MatchesTarget) return null;
+
+        // 重叠图标打开的是整个候选列表。点选的行要独立证明锚点身份。
+        var name = NormalizeCandidateText(target.TargetTp.Name ?? string.Empty);
+        var scene = MapLazyAssets.Get().ScenesDic[target.MapName];
+        return scene.Points.Count(point => NormalizeCandidateText(point.Name ?? string.Empty) == name
+            && (string.IsNullOrEmpty(candidate.IconType) || IsMapChooseIconTypeMatch(candidate.IconType, point.Type ?? string.Empty))) == 1
+            ? target.TargetTp
+            : null;
     }
 
     private List<ExpectedVisibleMapIcon> GetVisibleExpectedMapIcons(string mapName, Rect bigMapInAllMapRect)
@@ -3389,7 +3548,16 @@ public class TpTask
         var candidates = GetMapChooseCandidates(imageRegion);
         if (candidates.Count > 0)
         {
-            return ChooseMapCandidate(candidates, targetTp);
+            var chosen = ChooseMapCandidate(candidates, targetTp);
+            if (chosen != null && targetTp != null)
+            {
+                var targetName = NormalizeCandidateText(targetTp.Name ?? string.Empty);
+                bool IsTarget(MapChooseCandidate candidate) => targetName.Length > 0
+                    && NormalizeCandidateText(candidate.Text) == targetName
+                    && IsMapChooseIconTypeMatch(candidate.IconType, targetTp.Type ?? string.Empty);
+                chosen.MatchesTarget = IsTarget(chosen) && candidates.Count(IsTarget) == 1;
+            }
+            return chosen;
         }
 
         return GetMapChooseCandidateByTargetText(imageRegion, targetTp);
@@ -3455,6 +3623,7 @@ public class TpTask
                 IconFileName = string.Empty,
                 IconType = string.Empty,
                 Text = CleanCandidateText(matchedRegion.Text),
+                MatchesTarget = NormalizeCandidateText(matchedRegion.Text) == targetName,
                 IconRect = new Rect(
                     _assets.MapChooseIconRoi.X,
                     clickRect.Y,
