@@ -38,7 +38,7 @@ internal static class InstrumentExitRecovery
     }
 
     internal static async Task RecoverAsync(GameRuntime? runtime, CancellationToken ct,
-        Func<ImageRegion, bool>? canResumeInWorld = null, Action<ImageRegion>? observeTransition = null)
+        Func<ImageRegion, bool>? canResumeInWorld = null)
     {
         if (runtime == null) throw new OperationCanceledException("游戏窗口尚未绑定", ct);
         var flow = new InstrumentExitFlow();
@@ -79,7 +79,6 @@ internal static class InstrumentExitRecovery
                     continue;
                 }
 
-                if (view == InstrumentExitScreen.Other) observeTransition?.Invoke(screen);
                 if (worldReady && !sameWorld) screen.SrcMat.CopyTo(previousWorld);
                 hasPreviousWorld = worldReady;
                 var action = flow.Observe(view, sameWorld, worldReady);
