@@ -16,6 +16,8 @@ namespace BetterGenshinImpact.GameTask.Common.Job;
 
 internal static class InstrumentExitRecovery
 {
+    internal sealed class CaptureStoppedException() : NormalEndException("演奏恢复失败：截图器已停止");
+
     internal static bool IsRecoveryScreen(ImageRegion screen)
     {
         return NeedsRecovery(Classify(screen));
@@ -54,7 +56,10 @@ internal static class InstrumentExitRecovery
             if (!ReferenceEquals(TaskContext.Instance().Runtime, runtime) || !runtime.Window.IsAlive)
                 throw new OperationCanceledException("绑定的游戏窗口已更换或关闭", ct);
             if (!runtime.Capture.IsCapturing)
-                throw new NormalEndException("演奏恢复失败：截图器已停止");
+            {
+                ct.ThrowIfCancellationRequested();
+                throw new CaptureStoppedException();
+            }
 
             var viewport = runtime.Window.Viewport.ScreenRect;
             using var frame = CanObserve(runtime) ? runtime.Capture.Capture() : null;
