@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.GameTask.AutoGeniusInvokation.Exception;
 using BetterGenshinImpact.GameTask.Common.BgiVision;
 using BetterGenshinImpact.GameTask.Common.Element.Assets;
 using BetterGenshinImpact.GameTask.Model.Area;
@@ -52,6 +53,8 @@ internal static class InstrumentExitRecovery
             await Task.Delay(400, ct);
             if (!ReferenceEquals(TaskContext.Instance().Runtime, runtime) || !runtime.Window.IsAlive)
                 throw new OperationCanceledException("绑定的游戏窗口已更换或关闭", ct);
+            if (!runtime.Capture.IsCapturing)
+                throw new NormalEndException("演奏恢复失败：截图器已停止");
 
             var viewport = runtime.Window.Viewport.ScreenRect;
             using var frame = CanObserve(runtime) ? runtime.Capture.Capture() : null;
@@ -96,7 +99,7 @@ internal static class InstrumentExitRecovery
     }
 
     private static bool CanObserve(GameRuntime runtime) =>
-        ReferenceEquals(TaskContext.Instance().Runtime, runtime) && runtime.Window.IsAlive
+        ReferenceEquals(TaskContext.Instance().Runtime, runtime) && runtime.Window.IsAlive && runtime.Capture.IsCapturing
         && !RunnerContext.Instance.IsSuspend && !runtime.Window.IsMinimized
         && (!runtime.Window.RequiresForeground || runtime.Window.IsForeground)
         && runtime.Window.Viewport.ScreenRect == TaskContext.Instance().SystemInfo.CaptureAreaRect;
